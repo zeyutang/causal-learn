@@ -13,6 +13,7 @@ fisherz = "fisherz"
 mv_fisherz = "mv_fisherz"
 mc_fisherz = "mc_fisherz"
 kci = "kci"
+wbkci = "wbkci"
 chisq = "chisq"
 gsq = "gsq"
 d_separation = "d_separation"
@@ -23,7 +24,7 @@ def CIT(data, method='fisherz', **kwargs):
     Parameters
     ----------
     data: numpy.ndarray of shape (n_samples, n_features)
-    method: str, in ["fisherz", "mv_fisherz", "mc_fisherz", "kci", "chisq", "gsq"]
+    method: str, in ["fisherz", "mv_fisherz", "mc_fisherz", "kci", "wbkci", "chisq", "gsq"]
     kwargs: placeholder for future arguments, or for KCI specific arguments now
         TODO: utimately kwargs should be replaced by explicit named parameters.
               check https://github.com/cmu-phil/causal-learn/pull/62#discussion_r927239028
@@ -32,6 +33,8 @@ def CIT(data, method='fisherz', **kwargs):
         return FisherZ(data, **kwargs)
     elif method == kci:
         return KCI(data, **kwargs)
+    elif method == wbkci:
+        return WB_KCI(data, **kwargs)
     elif method in [chisq, gsq]:
         return Chisq_or_Gsq(data, method_name=method, **kwargs)
     elif method == mv_fisherz:
@@ -116,7 +119,7 @@ class CIT_Base(object):
         # every time when cit is called, auto save to local cache.
         self.save_to_local_cache()
 
-        METHODS_SUPPORTING_MULTIDIM_DATA = ["kci"]
+        METHODS_SUPPORTING_MULTIDIM_DATA = ["kci", "wbkci", ]
         if condition_set is None: condition_set = []
         # 'int' to convert np.*int* to built-in int; 'set' to remove duplicates; sorted for hashing
         condition_set = sorted(set(map(int, condition_set)))
@@ -192,6 +195,147 @@ class KCI(CIT_Base):
             self.kci_ci.compute_pvalue(self.data[:, Xs], self.data[:, Ys], self.data[:, condition_set])[0]
         self.pvalue_cache[cache_key] = p
         return p
+
+
+class WB_KCI(CIT_Base):
+    def __init__(self, data, **kwargs):
+        super().__init__(data, **kwargs)
+        kci_ui_kwargs = {
+            k: v
+            for k, v in kwargs.items() if k in [
+                'kernelX', 'kernelY', 'null_ss', 'approx', 'est_width',
+                'polyd', 'kwidthx', 'kwidthy'
+            ]
+        }
+        kci_ci_kwargs = {
+            k: v
+            for k, v in kwargs.items() if k in [
+                'kernelX', 'kernelY', 'kernelZ', 'null_ss', 'approx', 'use_gp',
+                'est_width', 'polyd', 'kwidthx', 'kwidthy', 'kwidthz'
+            ]
+        }
+
+        # Additional arguments to control how weightings are handled
+        if 'bootstrap_seed' not in kwargs:
+            kwargs['bootstrap_seed'] = 1234
+        if 'n_bootstrap_resample' not in kwargs:
+            kwargs['n_bootstrap_resample'] = 10
+        if 'weightings' not in kwargs:
+            kwargs['weightings'] = np.ones(shape=(self.sample_size, ))
+
+        wbkci_kwargs = dict(
+            **kci_ci_kwargs, **{
+                k: v
+                for k, v in kwargs.items() if k in [
+                    'bootstrap_seed',
+                    'n_bootstrap_resample',
+                    'weightings',
+                ]
+            })
+        self.check_cache_method_consistent(
+            'wbkci',
+            hashlib.md5(
+                json.dumps(wbkci_kwargs,
+                           sort_keys=True).encode('utf-8')).hexdigest())
+
+        self.assert_input_data_is_valid()
+        self.kci_ui = KCI_UInd(**kci_ui_kwargs)
+        self.kci_ci = KCI_CInd(**kci_ci_kwargs)
+
+        # No explicit instance type checks
+        self.bootstrap_seed = wbkci_kwargs['bootstrap_seed']
+        self.n_bootstrap_resample = wbkci_kwargs['n_bootstrap_resample']
+        self.weightings = wbkci_kwargs['weightings'].astype(int).reshape(-1, )
+
+        # Check number of weightings provided
+        assert self.weightings.shape[
+            0] == self.sample_size, "Provided weightings have incorrect shape."
+
+    def __call__(self, X, Y, condition_set=None):
+        # Regularly, cachekey looks like "col(X1).col(X2);col(Y1).col(Y2)|col(S1).col(S2).col(S3)"
+        # After introducing weightings, e.g., (n_Bootstrap_resample + 1) multiple testing
+        # Use cachekey + {":0" ... ":n_Bootstrap_resample"}, where 0 corresponds to w/out weightings
+        # Regular cachekey for KCI test
+        Xs, Ys, condition_set, cache_key = self.get_formatted_XYZ_and_cachekey(
+            X, Y, condition_set)
+
+        # The array to save p-values, initialized with -1
+        self.pvalue_with_resamples = np.zeros(
+            shape=(1 + self.n_bootstrap_resample,
+                   )) - 1  # no weighting + n_bootsrap_resample
+
+        # Define rng
+        rng = np.random.default_rng(seed=self.bootstrap_seed)
+
+        # Get duplicates according to the integer weightings, from which Bootstrap will get iid resamples
+        self.data_dup = np.repeat(self.data, self.weightings, axis=0)
+
+        # Perform test over ht eoriginal sample, as if there were no weightings
+        cache_key_no_weighting = cache_key + ':0'  # idx 0 for pvalue without weighting
+        if cache_key_no_weighting in self.pvalue_cache:
+            self.pvalue_with_resamples[0] = self.pvalue_cache[
+                cache_key_no_weighting]
+        else:
+            if 0 == len(condition_set):
+                p_no_weighting = self.kci_ui.compute_pvalue(
+                    self.data[:, Xs], self.data[:, Ys])[0]
+            else:
+                p_no_weighting = self.kci_ci.compute_pvalue(
+                    self.data[:, Xs], self.data[:, Ys],
+                    self.data[:, condition_set])[0]
+
+            self.pvalue_with_resamples[0] = p_no_weighting
+
+        # Perform multiple test over Bootstrap resamples and record p-values
+        for i in range(self.n_bootstrap_resample):
+            bootstrap_resample_indices = rng.choice(np.arange(
+                self.data_dup.shape[0]),
+                                                    size=self.sample_size,
+                                                    replace=True)
+            data_bootstrap_resample = self.data_dup[
+                bootstrap_resample_indices, :]
+
+            # Update current cache key
+            cache_key_with_weighting = cache_key + f':{i + 1}'
+            if cache_key_with_weighting in self.pvalue_cache:
+                self.pvalue_with_resamples[
+                    i + 1] = self.pvalue_cache[cache_key_with_weighting]
+            else:
+                if 0 == len(condition_set):
+                    p_with_weighting = self.kci_ui.compute_pvalue(
+                        data_bootstrap_resample[:, Xs],
+                        data_bootstrap_resample[:, Ys])[0]
+                else:
+                    p_with_weighting = self.kci_ci.compute_pvalue(
+                        data_bootstrap_resample[:, Xs],
+                        data_bootstrap_resample[:, Ys],
+                        data_bootstrap_resample[:, condition_set])[0]
+
+                self.pvalue_with_resamples[i + 1] = p_with_weighting
+
+        # Correct p-value with min(0.5, pval * (correction coef)), use 0.5 since (potentially) double-sided testing
+        assert not np.any(
+            self.pvalue_with_resamples < 0
+        ), 'There exists at least one p-values not correctly calculated.'
+
+        # Sort the p-values in multiple tests, using Holm's procedure to get the corrected p-value for no-weighting
+        # TODO this is not the complete implementation of Holm's procedure, the correction is on p-value (since alpha is not an input)
+        # NOTE the corrected p-value as output may or may not work well with uc_rule and uc_priority
+        # - if p-value after correction exceeds alpha, null will be accepted anyway
+        # - if p-value after correction is smaller than alpha, null can still be accepted by Holm's procedure if at least
+        #   one smaller p-values are accepted after correction
+        sorted_pvalue_idx = np.argsort(self.pvalue_with_resamples)
+        loc_in_sorted_no_weighting = int(
+            np.where(sorted_pvalue_idx == 0)[0])  # the x-th small p-value
+        correction_coef_no_weighting = self.n_bootstrap_resample + 1 - loc_in_sorted_no_weighting
+        p_no_weighting_corrected = min(
+            0.5, self.pvalue_with_resamples[0] * correction_coef_no_weighting)
+
+        # The original cache_key
+        self.pvalue_cache[cache_key] = p_no_weighting_corrected
+        
+        return p_no_weighting_corrected
+
 
 class Chisq_or_Gsq(CIT_Base):
     def __init__(self, data, method_name, **kwargs):
