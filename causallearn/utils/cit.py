@@ -222,6 +222,8 @@ class WB_KCI(CIT_Base):
             kwargs['n_bootstrap_resample'] = 10
         if 'weightings' not in kwargs:
             kwargs['weightings'] = np.ones(shape=(self.sample_size, ))
+        if 'alpha' not in kwargs:
+            kwargs['alpha'] = 0.05
 
         wbkci_kwargs = dict(
             **kci_ci_kwargs, **{
@@ -230,12 +232,19 @@ class WB_KCI(CIT_Base):
                     'bootstrap_seed',
                     'n_bootstrap_resample',
                     'weightings',
+                    'alpha',
                 ]
             })
+
+        # Solve TypeError: Object of type ndarray is not JSON serializable
+        wbkci_kwargs_for_json_serialization = wbkci_kwargs.copy()
+        wbkci_kwargs_for_json_serialization['weightings'] = wbkci_kwargs[
+            'weightings'].tolist()
+
         self.check_cache_method_consistent(
             'wbkci',
             hashlib.md5(
-                json.dumps(wbkci_kwargs,
+                json.dumps(wbkci_kwargs_for_json_serialization,
                            sort_keys=True).encode('utf-8')).hexdigest())
 
         self.assert_input_data_is_valid()
@@ -246,45 +255,32 @@ class WB_KCI(CIT_Base):
         self.bootstrap_seed = wbkci_kwargs['bootstrap_seed']
         self.n_bootstrap_resample = wbkci_kwargs['n_bootstrap_resample']
         self.weightings = wbkci_kwargs['weightings'].astype(int).reshape(-1, )
-
+        self.alpha = wbkci_kwargs['alpha']
+        
         # Check number of weightings provided
         assert self.weightings.shape[
             0] == self.sample_size, "Provided weightings have incorrect shape."
+        
+        # Check number of Bootstrap resample
+        assert self.n_bootstrap_resample > 0, "Invalid input for Bootstrap resample rounds (positive integer)."
 
     def __call__(self, X, Y, condition_set=None):
         # Regularly, cachekey looks like "col(X1).col(X2);col(Y1).col(Y2)|col(S1).col(S2).col(S3)"
-        # After introducing weightings, e.g., (n_Bootstrap_resample + 1) multiple testing
-        # Use cachekey + {":0" ... ":n_Bootstrap_resample"}, where 0 corresponds to w/out weightings
+        # After introducing weightings, e.g., n_Bootstrap_resample multiple testing
+        # Use cachekey + {":0" ... ":(n_Bootstrap_resample-1)"}
         # Regular cachekey for KCI test
         Xs, Ys, condition_set, cache_key = self.get_formatted_XYZ_and_cachekey(
             X, Y, condition_set)
 
         # The array to save p-values, initialized with -1
-        self.pvalue_with_resamples = np.zeros(
-            shape=(1 + self.n_bootstrap_resample,
-                   )) - 1  # no weighting + n_bootsrap_resample
+        self.pvalue_with_weighting = np.zeros(
+            shape=(self.n_bootstrap_resample, )) - 1
 
         # Define rng
         rng = np.random.default_rng(seed=self.bootstrap_seed)
 
         # Get duplicates according to the integer weightings, from which Bootstrap will get iid resamples
         self.data_dup = np.repeat(self.data, self.weightings, axis=0)
-
-        # Perform test over ht eoriginal sample, as if there were no weightings
-        cache_key_no_weighting = cache_key + ':0'  # idx 0 for pvalue without weighting
-        if cache_key_no_weighting in self.pvalue_cache:
-            self.pvalue_with_resamples[0] = self.pvalue_cache[
-                cache_key_no_weighting]
-        else:
-            if 0 == len(condition_set):
-                p_no_weighting = self.kci_ui.compute_pvalue(
-                    self.data[:, Xs], self.data[:, Ys])[0]
-            else:
-                p_no_weighting = self.kci_ci.compute_pvalue(
-                    self.data[:, Xs], self.data[:, Ys],
-                    self.data[:, condition_set])[0]
-
-            self.pvalue_with_resamples[0] = p_no_weighting
 
         # Perform multiple test over Bootstrap resamples and record p-values
         for i in range(self.n_bootstrap_resample):
@@ -296,45 +292,62 @@ class WB_KCI(CIT_Base):
                 bootstrap_resample_indices, :]
 
             # Update current cache key
-            cache_key_with_weighting = cache_key + f':{i + 1}'
+            cache_key_with_weighting = cache_key + f':{i}'
             if cache_key_with_weighting in self.pvalue_cache:
-                self.pvalue_with_resamples[
-                    i + 1] = self.pvalue_cache[cache_key_with_weighting]
+                self.pvalue_with_weighting[i] = self.pvalue_cache[
+                    cache_key_with_weighting]
             else:
                 if 0 == len(condition_set):
-                    p_with_weighting = self.kci_ui.compute_pvalue(
+                    _p = self.kci_ui.compute_pvalue(
                         data_bootstrap_resample[:, Xs],
                         data_bootstrap_resample[:, Ys])[0]
                 else:
-                    p_with_weighting = self.kci_ci.compute_pvalue(
+                    _p = self.kci_ci.compute_pvalue(
                         data_bootstrap_resample[:, Xs],
                         data_bootstrap_resample[:, Ys],
                         data_bootstrap_resample[:, condition_set])[0]
 
-                self.pvalue_with_resamples[i + 1] = p_with_weighting
+                self.pvalue_with_weighting[i] = _p
 
-        # Correct p-value with min(0.5, pval * (correction coef)), use 0.5 since (potentially) double-sided testing
         assert not np.any(
-            self.pvalue_with_resamples < 0
-        ), 'There exists at least one p-values not correctly calculated.'
+            self.pvalue_with_weighting < 0
+        ), 'There exists at least one p-values not calculated.'
 
-        # Sort the p-values in multiple tests, using Holm's procedure to get the corrected p-value for no-weighting
-        # TODO this is not the complete implementation of Holm's procedure, the correction is on p-value (since alpha is not an input)
+        # --> Use Holm's procedure (which controls FWER) to see if any of the test is rejected
+        """If Holm's procedure, too many false negatives may be a problem
         # NOTE the corrected p-value as output may or may not work well with uc_rule and uc_priority
         # - if p-value after correction exceeds alpha, null will be accepted anyway
         # - if p-value after correction is smaller than alpha, null can still be accepted by Holm's procedure if at least
         #   one smaller p-values are accepted after correction
-        sorted_pvalue_idx = np.argsort(self.pvalue_with_resamples)
-        loc_in_sorted_no_weighting = int(
-            np.where(sorted_pvalue_idx == 0)[0])  # the x-th small p-value
-        correction_coef_no_weighting = self.n_bootstrap_resample + 1 - loc_in_sorted_no_weighting
-        p_no_weighting_corrected = min(
-            0.5, self.pvalue_with_resamples[0] * correction_coef_no_weighting)
 
-        # The original cache_key
-        self.pvalue_cache[cache_key] = p_no_weighting_corrected
+        # Sort the p-values in multiple tests
+        self.pvalue_with_weighting = np.sort(self.pvalue_with_weighting)
+
+        # Get the denominator for the alpha correction in Holm's procedure
+        denominator = np.arange(self.n_bootstrap_resample) + 1
+        denominator = denominator[::-1]
+        alpha_corrected = self.alpha / denominator
+
+        # Find the first failure to reject, as per Holm's procedure
+        idx_fail_to_reject = np.where(
+            self.pvalue_with_weighting >= alpha_corrected)[0]
+        if 0 == len(idx_fail_to_reject):
+            p = self.pvalue_with_weighting[-1]
+        else:
+            # Use this p-value (after correction) as the test p-value output
+            idx_first_fail_to_reject = idx_fail_to_reject[0]
+            p = self.pvalue_with_weighting[
+                idx_first_fail_to_reject] * denominator[
+                    idx_first_fail_to_reject]
+        """
+                
+        # --> Use the median of density of p-values (since all tests are intended to be based on the same distribution)
+        p = np.median(self.pvalue_with_weighting)
         
-        return p_no_weighting_corrected
+        # Original pvalue cachekey
+        self.pvalue_cache[cache_key] = p
+
+        return p
 
 
 class Chisq_or_Gsq(CIT_Base):
