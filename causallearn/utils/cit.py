@@ -219,11 +219,11 @@ class WB_KCI(CIT_Base):
         if 'bootstrap_seed' not in kwargs:
             kwargs['bootstrap_seed'] = 1234
         if 'n_bootstrap_resample' not in kwargs:
-            kwargs['n_bootstrap_resample'] = 10
+            kwargs['n_bootstrap_resample'] = 25
         if 'weightings' not in kwargs:
             kwargs['weightings'] = np.ones(shape=(self.sample_size, ))
         if 'alpha' not in kwargs:
-            kwargs['alpha'] = 0.05
+            kwargs['alpha'] = 0.05  # will only be used if choose Holm's procedure
 
         wbkci_kwargs = dict(
             **kci_ci_kwargs, **{
